@@ -2,13 +2,14 @@
 
 `discrawl` mirrors Discord guild data into local SQLite so you can search, inspect, and query server history without depending on Discord search.
 
-It is a bot-token crawler. No user-token hacks. Data stays local.
+This fork is user-token-first and also supports bot tokens. Data stays local.
 
 ## What It Does
 
-- discovers every guild the configured bot can access
+- discovers every guild the configured token can access
 - syncs channels, threads, members, and message history into SQLite
 - maintains FTS5 search indexes for fast local text search
+- builds an offline member directory from archived profile payloads
 - extracts small text-like attachments into the local search index
 - records structured user and role mentions for direct querying
 - tails Gateway events for live updates, with periodic repair syncs
@@ -20,14 +21,24 @@ Search defaults to all guilds. `sync` and `tail` default to the configured defau
 ## Requirements
 
 - Go `1.26+`
-- a Discord bot token the bot can use to read the target guilds
-- bot permissions for the channels you want archived
+- a Discord token that can read the target guilds
+- for bot tokens, bot permissions for the channels you want archived
+
+### Discord Auth Setup
+
+`discrawl-self` can authenticate with either:
+
+- a user token sent as raw `Authorization: <token>`
+- a bot token sent as `Authorization: Bot <token>`
+
+Choose auth mode with `discord.token_kind`:
+
+- `user` - default in this fork
+- `bot` - bot-compatible header formatting
 
 ### Discord Bot Setup
 
-`discrawl` needs a real bot token. Not a user token.
-
-Minimum practical setup:
+If you use a bot token, minimum practical setup:
 
 1. Create or reuse a Discord application in the Discord developer portal.
 2. Add a bot user to that application.
@@ -41,27 +52,28 @@ Minimum practical setup:
 
 Without those intents/permissions, `sync`, `tail`, member snapshots, or message content archiving will be partial or fail.
 
-### Bot Token Sources
+### Token Sources
 
 Token resolution:
 
 1. OpenClaw config, if `discord.token_source` is not `env`
 2. `DISCORD_BOT_TOKEN` or the configured `discord.token_env`
 
-`discrawl` accepts either raw token text or a value prefixed with `Bot `. It normalizes that automatically.
+`discrawl` accepts raw token text or a value prefixed with `Bot `.
+In `user` mode it sends the raw token. In `bot` mode it normalizes to `Bot <token>`.
 
 Fastest env-only path:
 
 ```bash
-export DISCORD_BOT_TOKEN="your-bot-token"
-bin/discrawl doctor
-bin/discrawl init
+export DISCORD_BOT_TOKEN="your-token"
+discrawl doctor
+discrawl init
 ```
 
 If you keep shell secrets in `~/.profile`, add:
 
 ```bash
-export DISCORD_BOT_TOKEN="your-bot-token"
+export DISCORD_BOT_TOKEN="your-token"
 ```
 
 Then reload your shell before running `discrawl`.
@@ -77,41 +89,50 @@ Default runtime paths:
 
 ## Install
 
+GitHub Releases:
+
+```bash
+gh release download --repo Microck/discrawl-self --pattern 'discrawl_*_linux_amd64.tar.gz'
+tar -xzf discrawl_*_linux_amd64.tar.gz
+./discrawl --version
+```
+
 Build from source:
 
 ```bash
-git clone https://github.com/steipete/discrawl.git
-cd discrawl
+git clone https://github.com/Microck/discrawl-self.git
+cd discrawl-self
 go build -o bin/discrawl ./cmd/discrawl
 ./bin/discrawl --version
 ```
 
-Homebrew tap:
-
-```bash
-brew tap steipete/tap
-brew install steipete/tap/discrawl
-```
+Examples below assume `discrawl` is on `PATH`. If you built from source without installing it, replace `discrawl` with `./bin/discrawl`.
 
 ## Quick Start
 
-Reuse an existing OpenClaw Discord bot config:
+Reuse an existing OpenClaw Discord config:
 
 ```bash
-bin/discrawl init --from-openclaw ~/.openclaw/openclaw.json
-bin/discrawl doctor
-bin/discrawl sync --full
-bin/discrawl search "panic: nil pointer"
-bin/discrawl tail
+discrawl init --from-openclaw ~/.openclaw/openclaw.json
+discrawl doctor
+discrawl sync --full
+discrawl search "panic: nil pointer"
+discrawl tail
+```
+
+Multi-account OpenClaw setup:
+
+```bash
+discrawl init --from-openclaw ~/.openclaw/openclaw.json --account atlas
 ```
 
 Env-only setup:
 
 ```bash
 export DISCORD_BOT_TOKEN="..."
-bin/discrawl doctor
-bin/discrawl init
-bin/discrawl sync --full
+discrawl doctor
+discrawl init
+discrawl sync --full
 ```
 
 `init` discovers accessible guilds and writes `~/.discrawl/config.toml`. If exactly one guild is available, that guild becomes the default automatically.
@@ -120,8 +141,9 @@ bin/discrawl sync --full
 
 - confirms config can be loaded
 - shows where the token was resolved from
-- verifies bot auth
-- shows how many guilds the bot can access
+- shows which auth mode is active
+- verifies Discord auth
+- shows how many guilds the token can access
 - verifies DB + FTS wiring
 
 ## Commands
@@ -131,34 +153,46 @@ bin/discrawl sync --full
 Creates the local config and discovers accessible guilds.
 
 ```bash
-bin/discrawl init
-bin/discrawl init --from-openclaw ~/.openclaw/openclaw.json
-bin/discrawl init --guild 123456789012345678
-bin/discrawl init --db ~/data/discrawl.db
+discrawl init
+discrawl init --from-openclaw ~/.openclaw/openclaw.json
+discrawl init --from-openclaw ~/.openclaw/openclaw.json --account atlas
+discrawl init --guild 123456789012345678
+discrawl init --db ~/data/discrawl.db
 ```
+
+When OpenClaw config tokens use `${ENV_VAR}` placeholders, `init` and `doctor` resolve them before auth.
 
 ### `sync`
 
 Backfills guild state into SQLite.
 
 ```bash
-bin/discrawl sync --full
-bin/discrawl sync --guild 123456789012345678
-bin/discrawl sync --guilds 123,456 --concurrency 8
-bin/discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
+discrawl sync --full
+discrawl sync --full --all
+discrawl sync --guild 123456789012345678
+discrawl sync --guilds 123,456 --concurrency 8
+discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z
 ```
 
 `sync` already uses parallel channel workers. `--concurrency` overrides the default, and the default is auto-sized from `GOMAXPROCS` with a floor of `8` and a cap of `32`.
+`--all` ignores `default_guild_id` and fans out across every discovered guild the token can access.
 When `--channels` includes a forum channel id, `discrawl` expands that forum's threads and syncs their messages as part of the targeted run.
+`--since` limits initial history/bootstrap and full-history backfill to messages at or after the given RFC3339 timestamp. It does not mark older history as complete, so a later `sync --full` without `--since` can continue the backfill.
+Long runs now emit periodic progress logs to stderr so large backfills do not look hung.
+If in-flight channels stop completing for a while, `discrawl` now emits `message sync waiting` heartbeat logs with the oldest active channel, per-channel page activity, and skip/defer counters, and every run ends with a `message sync finished` summary.
+Each channel crawl also has a bounded runtime budget, so a pathological channel is deferred and retried on the next sync instead of pinning a worker forever.
+Full sync member refresh is best-effort and currently gives up after five minutes without a caller-supplied deadline, so message sync completion is not held hostage by a slow guild member crawl.
+When the archive is already complete, `sync --full` now reuses the stored backlog markers and limits steady-state refresh to live top-level channels plus active threads instead of revisiting every stored archived thread.
+If a guild already has a local member snapshot, routine syncs reuse it and skip another full member crawl until that snapshot ages out.
 
 ### `tail`
 
 Runs the live Gateway tail and periodic repair loop.
 
 ```bash
-bin/discrawl tail
-bin/discrawl tail --guild 123456789012345678
-bin/discrawl tail --repair-every 30m
+discrawl tail
+discrawl tail --guild 123456789012345678
+discrawl tail --repair-every 30m
 ```
 
 ### `search`
@@ -166,32 +200,38 @@ bin/discrawl tail --repair-every 30m
 Runs FTS search over archived messages.
 
 ```bash
-bin/discrawl search "panic: nil pointer"
-bin/discrawl search --guild 123456789012345678 "payment failed"
-bin/discrawl search --channel billing --author steipete --limit 50 "invoice"
-bin/discrawl search --include-empty "GitHub"
-bin/discrawl --json search "websocket closed"
+discrawl search "panic: nil pointer"
+discrawl search --guild 123456789012345678 "payment failed"
+discrawl search --channel billing --author steipete --limit 50 "invoice"
+discrawl search --include-empty "GitHub"
+discrawl --json search "websocket closed"
 ```
 
 By default, `search` skips rows with no searchable content. Attachment text, attachment filenames, embeds, and replies still count as content. Use `--include-empty` to opt back in.
+Search returns the newest matching messages first so large local archives stay responsive.
 
 ### `messages`
 
 Lists exact message slices by channel, author, and time range.
 
 ```bash
-bin/discrawl messages --channel maintainers --days 7 --all
-bin/discrawl messages --channel "#maintainers" --since 2026-03-01T00:00:00Z
-bin/discrawl messages --channel 1456744319972282449 --author steipete --limit 50
-bin/discrawl messages --channel maintainers --days 7 --all --include-empty
-bin/discrawl --json messages --channel maintainers --days 3
+discrawl messages --channel maintainers --days 7 --all
+discrawl messages --channel maintainers --hours 6 --all
+discrawl messages --channel "#maintainers" --since 2026-03-01T00:00:00Z
+discrawl messages --channel 1456744319972282449 --author steipete --limit 50
+discrawl messages --channel maintainers --last 100 --sync
+discrawl messages --channel maintainers --days 7 --all --include-empty
+discrawl --json messages --channel maintainers --days 3
 ```
 
 Notes:
 
 - `--channel` accepts a channel id, exact name, `#name`, or partial name match
+- `--hours` is shorthand for "since now minus N hours"
 - `--days` is shorthand for "since now minus N days"
+- `--last` returns the newest `N` matching messages, then prints them oldest-to-newest
 - `--all` removes the safety limit; default is `200`
+- `--sync` runs a blocking pre-query sync for the matching channel or guild scope before reading the local DB
 - rows with no displayable/searchable content are skipped by default; `--include-empty` opts back in
 - at least one filter is required
 
@@ -200,10 +240,10 @@ Notes:
 Lists structured user and role mentions.
 
 ```bash
-bin/discrawl mentions --channel maintainers --days 7
-bin/discrawl mentions --target steipete --type user --limit 50
-bin/discrawl mentions --target 1456406468898197625
-bin/discrawl --json mentions --type role --days 1
+discrawl mentions --channel maintainers --days 7
+discrawl mentions --target steipete --type user --limit 50
+discrawl mentions --target 1456406468898197625
+discrawl --json mentions --type role --days 1
 ```
 
 Notes:
@@ -217,30 +257,69 @@ Notes:
 Runs read-only SQL against the local database.
 
 ```bash
-bin/discrawl sql 'select count(*) as messages from messages'
-echo 'select guild_id, count(*) from messages group by guild_id' | bin/discrawl sql -
+discrawl sql 'select count(*) as messages from messages'
+echo 'select guild_id, count(*) from messages group by guild_id' | discrawl sql -
 ```
 
 ### `members`
 
 ```bash
-bin/discrawl members list
-bin/discrawl members show 123456789012345678
-bin/discrawl members show --messages 10 steipete
-bin/discrawl members search "peter"
-bin/discrawl members search "github"
+discrawl members list
+discrawl members show 123456789012345678
+discrawl members show --messages 10 steipete
+discrawl members search "peter"
+discrawl members search "github"
+discrawl members search "https://github.com/steipete"
 ```
 
 Notes:
 
 - `search` matches names plus any offline profile fields present in the archived member payload
 - `show` accepts a user id or query; if it resolves to one member, it also shows recent messages
+- extracted profile fields may include `bio`, `pronouns`, `location`, `website`, `x`, `github`, and discovered URLs
+- if the token cannot see a field from Discord, `discrawl` cannot invent it; this is strictly archive-based offline data
+
+Typical workflow:
+
+```bash
+discrawl sync --full
+discrawl members search "design engineer"
+discrawl members search "github"
+discrawl members show --messages 25 steipete
+discrawl messages --author steipete --days 30 --all
+```
+
+Typical `members show` output:
+
+```text
+guild=1456350064065904867
+user=37658261826043904
+username=steipete
+display=Peter Steinberger
+joined=2026-03-08T16:03:14Z
+bot=false
+x=steipete
+github=steipete
+website=https://steipete.me
+bio=Builds native apps and tooling.
+urls=https://steipete.me, https://github.com/steipete
+message_count=1284
+first_message=2026-02-01T09:00:00Z
+last_message=2026-03-08T15:59:58Z
+```
+
+Searchable member data comes from:
+
+- Discord member/user payload fields archived into `members.raw_json`
+- explicit profile fields when Discord exposes them
+- URLs and social handles inferred from archived profile text
+- current member snapshot data such as names, nick, roles, and join time
 
 ### `channels`
 
 ```bash
-bin/discrawl channels list
-bin/discrawl channels show 123456789012345678
+discrawl channels list
+discrawl channels show 123456789012345678
 ```
 
 ### `status`
@@ -248,7 +327,7 @@ bin/discrawl channels show 123456789012345678
 Shows local archive status.
 
 ```bash
-bin/discrawl status
+discrawl status
 ```
 
 ### `doctor`
@@ -256,7 +335,7 @@ bin/discrawl status
 Checks config, auth, DB, and FTS wiring.
 
 ```bash
-bin/discrawl doctor
+discrawl doctor
 ```
 
 ## Configuration
@@ -278,6 +357,7 @@ token_source = "openclaw"
 openclaw_config = "~/.openclaw/openclaw.json"
 account = "default"
 token_env = "DISCORD_BOT_TOKEN"
+token_kind = "user"
 
 [sync]
 concurrency = 16
@@ -303,6 +383,7 @@ Config override rules:
 - `--config` beats everything
 - `DISCRAWL_CONFIG` overrides the default config path
 - `discord.token_source = "env"` forces env-only token lookup
+- `discord.token_kind = "user" | "bot"` chooses auth header style
 
 ## Embeddings
 
@@ -312,8 +393,8 @@ If enabled, embeddings are intended to enrich recall in background batches, not 
 
 ```bash
 export OPENAI_API_KEY="..."
-bin/discrawl init --with-embeddings
-bin/discrawl sync --with-embeddings
+discrawl init --with-embeddings
+discrawl sync --with-embeddings
 ```
 
 ## Data Stored Locally
@@ -326,13 +407,15 @@ bin/discrawl sync --with-embeddings
 - FTS index rows
 - optional embedding backlog metadata
 
+SQLite schema migrations are versioned with `PRAGMA user_version`. Startup now fails fast when a local DB schema is newer than the supported binary.
+
 Attachment binaries are not stored in SQLite.
 
 Set `sync.attachment_text = false` if you want to keep attachment metadata and filenames but disable attachment body fetches for text indexing.
 
 ## Security
 
-- do not commit bot tokens or API keys
+- do not commit Discord tokens or API keys
 - default config lives in your home directory, not inside the repo
 - CI runs secret scanning with `gitleaks`
 - `doctor` reports token source, not token contents
