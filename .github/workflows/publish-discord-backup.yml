@@ -1,0 +1,102 @@
+name: publish-discord-backup
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-backup-repo
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout discrawl
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Restore Discord DB cache
+        id: restore-discord-db
+        uses: actions/cache/restore@v5.0.5
+        with:
+          path: |
+            .discrawl-ci/discrawl.db
+            .discrawl-ci/discrawl.db-shm
+            .discrawl-ci/discrawl.db-wal
+          key: discrawl-discord-db-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            discrawl-discord-db-${{ runner.os }}-${{ github.ref_name }}-
+            discrawl-discord-db-${{ runner.os }}-
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "discrawl publisher"
+          git config --global user.email "discrawl-publisher@users.noreply.github.com"
+
+      - name: Sync and publish Discord archive
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_BACKUP_TOKEN: ${{ secrets.DISCORD_BACKUP_TOKEN }}
+          DISCRAWL_BACKUP_REPOSITORY: ${{ secrets.DISCRAWL_BACKUP_REPOSITORY }}
+          DISCRAWL_GUILD_ID: ${{ secrets.DISCRAWL_GUILD_ID }}
+          CONFIG: ${{ runner.temp }}/discrawl/config.toml
+          DB: ${{ github.workspace }}/.discrawl-ci/discrawl.db
+          BACKUP_REPO: ${{ runner.temp }}/discord-backup
+        run: |
+          if [ -z "${DISCRAWL_BACKUP_REPOSITORY:-}" ]; then
+            echo "::notice title=Backup publish skipped::Configure DISCRAWL_BACKUP_REPOSITORY as owner/repo to enable archive publishing."
+            exit 0
+          fi
+          if [ -z "${DISCORD_BOT_TOKEN:-}" ]; then
+            echo "::error title=Missing secret::Configure DISCORD_BOT_TOKEN in the discrawl repo secrets."
+            exit 1
+          fi
+          if [ -z "${DISCORD_BACKUP_TOKEN:-}" ]; then
+            echo "::error title=Missing secret::Configure DISCORD_BACKUP_TOKEN with write access to the backup repository."
+            exit 1
+          fi
+          if [ -z "${DISCRAWL_GUILD_ID:-}" ]; then
+            echo "::error title=Missing secret::Configure DISCRAWL_GUILD_ID with the Discord guild to publish."
+            exit 1
+          fi
+          BACKUP_REMOTE="https://x-access-token:${DISCORD_BACKUP_TOKEN}@github.com/${DISCRAWL_BACKUP_REPOSITORY}.git"
+          mkdir -p "$(dirname "$CONFIG")"
+          mkdir -p "$(dirname "$DB")"
+          git clone "$BACKUP_REMOTE" "$BACKUP_REPO"
+          go run ./cmd/discrawl --config "$CONFIG" init --db "$DB" --guild "$DISCRAWL_GUILD_ID"
+          if [ -f "$BACKUP_REPO/manifest.json" ]; then
+            if [ -s "$DB" ]; then
+              echo "Restored Discord DB cache at $DB; skipping pre-sync snapshot import."
+            else
+              echo "Discord DB cache missing; importing latest published snapshot before latest-only sync."
+              go run ./cmd/discrawl --config "$CONFIG" update --repo "$BACKUP_REPO" --remote "$BACKUP_REMOTE"
+            fi
+          fi
+          go run ./cmd/discrawl --config "$CONFIG" sync --guild "$DISCRAWL_GUILD_ID" --skip-members --latest-only
+          git -C "$BACKUP_REPO" pull --ff-only origin main
+          go run ./cmd/discrawl --config "$CONFIG" publish \
+            --repo "$BACKUP_REPO" \
+            --remote "$BACKUP_REMOTE" \
+            --readme "$BACKUP_REPO/README.md" \
+            --message "sync: discord archive" \
+            --push
+
+      - name: Save Discord DB cache
+        uses: actions/cache/save@v5.0.5
+        with:
+          path: |
+            .discrawl-ci/discrawl.db
+            .discrawl-ci/discrawl.db-shm
+            .discrawl-ci/discrawl.db-wal
+          key: ${{ steps.restore-discord-db.outputs.cache-primary-key }}

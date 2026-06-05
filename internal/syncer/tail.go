@@ -2,11 +2,10 @@ package syncer
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/steipete/discrawl/internal/store"
+	"github.com/openclaw/discrawl/internal/store"
 )
 
 func (s *Syncer) RunTail(ctx context.Context, guildIDs []string, repairEvery time.Duration) error {
@@ -50,7 +49,7 @@ func (t *tailHandler) OnMessageCreate(ctx context.Context, msg *discordgo.Messag
 	if !t.allowGuild(msg.GuildID) {
 		return nil
 	}
-	mutation, err := buildMessageMutation(ctx, msg, "", false, t.attachmentTextEnabled)
+	mutation, err := buildMessageMutation(ctx, msg, "", "", false, t.attachmentTextEnabled)
 	if err != nil {
 		return err
 	}
@@ -70,7 +69,7 @@ func (t *tailHandler) OnMessageUpdate(ctx context.Context, msg *discordgo.Messag
 	if !t.allowGuild(msg.GuildID) {
 		return nil
 	}
-	mutation, err := buildMessageMutation(ctx, msg, "", false, t.attachmentTextEnabled)
+	mutation, err := buildMessageMutation(ctx, msg, "", "", false, t.attachmentTextEnabled)
 	if err != nil {
 		return err
 	}
@@ -97,8 +96,7 @@ func (t *tailHandler) OnChannelUpsert(ctx context.Context, channel *discordgo.Ch
 	if !t.allowGuild(channel.GuildID) {
 		return nil
 	}
-	raw, _ := json.Marshal(channel)
-	return t.store.UpsertChannel(ctx, toChannelRecord(channel, string(raw)))
+	return t.store.UpsertChannel(ctx, toChannelRecord(channel, marshalJSONString(channel, "{}")))
 }
 
 func (t *tailHandler) OnMemberUpsert(ctx context.Context, guildID string, member *discordgo.Member) error {

@@ -1,48 +1,63 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
+	"time"
 
-	"github.com/pelletier/go-toml/v2"
+	crawlconfig "github.com/openclaw/crawlkit/config"
+	crawlremote "github.com/openclaw/crawlkit/remote"
 )
 
 const (
-	DefaultConfigEnv = "DISCRAWL_CONFIG"
-	DefaultTokenEnv  = "DISCORD_BOT_TOKEN"
+	DefaultConfigEnv           = "DISCRAWL_CONFIG"
+	DefaultTokenEnv            = "DISCORD_BOT_TOKEN"
+	DefaultRemoteTokenEnv      = "DISCRAWL_REMOTE_TOKEN"
+	DefaultTokenKeyringService = "discrawl"
+	DefaultTokenKeyringAccount = "discord_bot_token"
 )
 
 type Config struct {
-	Version        int           `toml:"version"`
-	GuildID        string        `toml:"guild_id,omitempty"`
-	DefaultGuildID string        `toml:"default_guild_id,omitempty"`
-	GuildIDs       []string      `toml:"guild_ids,omitempty"`
-	DBPath         string        `toml:"db_path"`
-	CacheDir       string        `toml:"cache_dir"`
-	LogDir         string        `toml:"log_dir"`
-	Discord        DiscordConfig `toml:"discord"`
-	Sync           SyncConfig    `toml:"sync"`
-	Search         SearchConfig  `toml:"search"`
+	Version        int                `toml:"version"`
+	GuildID        string             `toml:"guild_id,omitempty"`
+	DefaultGuildID string             `toml:"default_guild_id,omitempty"`
+	GuildIDs       []string           `toml:"guild_ids,omitempty"`
+	DBPath         string             `toml:"db_path"`
+	CacheDir       string             `toml:"cache_dir"`
+	LogDir         string             `toml:"log_dir"`
+	Discord        DiscordConfig      `toml:"discord"`
+	Desktop        DesktopConfig      `toml:"desktop"`
+	Sync           SyncConfig         `toml:"sync"`
+	Search         SearchConfig       `toml:"search"`
+	Share          ShareConfig        `toml:"share"`
+	Remote         crawlremote.Config `toml:"remote"`
 }
 
 type DiscordConfig struct {
-	TokenSource    string `toml:"token_source"`
-	OpenClawConfig string `toml:"openclaw_config"`
-	Account        string `toml:"account"`
-	TokenEnv       string `toml:"token_env"`
+	TokenSource         string `toml:"token_source"`
+	TokenEnv            string `toml:"token_env"`
+	TokenKeyringService string `toml:"token_keyring_service"`
+	TokenKeyringAccount string `toml:"token_keyring_account"`
+}
+
+type DesktopConfig struct {
+	Path         string `toml:"path"`
+	MaxFileBytes int64  `toml:"max_file_bytes"`
+	FullCache    bool   `toml:"full_cache"`
 }
 
 type SyncConfig struct {
-	Concurrency    int    `toml:"concurrency"`
-	RepairEvery    string `toml:"repair_every"`
-	FullHistory    bool   `toml:"full_history"`
-	AttachmentText *bool  `toml:"attachment_text"`
+	Source             string `toml:"source"`
+	Concurrency        int    `toml:"concurrency"`
+	RepairEvery        string `toml:"repair_every"`
+	FullHistory        bool   `toml:"full_history"`
+	AttachmentText     *bool  `toml:"attachment_text"`
+	AttachmentMedia    *bool  `toml:"attachment_media"`
+	MaxAttachmentBytes int64  `toml:"max_attachment_bytes"`
 }
 
 type SearchConfig struct {
@@ -50,12 +65,31 @@ type SearchConfig struct {
 	Embeddings  EmbeddingsConfig `toml:"embeddings"`
 }
 
+type ShareConfig struct {
+	Remote     string            `toml:"remote,omitempty"`
+	RepoPath   string            `toml:"repo_path,omitempty"`
+	Branch     string            `toml:"branch,omitempty"`
+	AutoUpdate bool              `toml:"auto_update"`
+	StaleAfter string            `toml:"stale_after"`
+	Media      *bool             `toml:"media"`
+	Filter     ShareFilterConfig `toml:"filter"`
+}
+
+type ShareFilterConfig struct {
+	PublicOnly        bool     `toml:"public_only"`
+	IncludeChannelIDs []string `toml:"include_channel_ids,omitempty"`
+	ExcludeChannelIDs []string `toml:"exclude_channel_ids,omitempty"`
+}
+
 type EmbeddingsConfig struct {
-	Enabled   bool   `toml:"enabled"`
-	Provider  string `toml:"provider"`
-	Model     string `toml:"model"`
-	APIKeyEnv string `toml:"api_key_env"`
-	BatchSize int    `toml:"batch_size"`
+	Enabled        bool   `toml:"enabled"`
+	Provider       string `toml:"provider"`
+	Model          string `toml:"model"`
+	BaseURL        string `toml:"base_url"`
+	APIKeyEnv      string `toml:"api_key_env"`
+	BatchSize      int    `toml:"batch_size"`
+	MaxInputChars  int    `toml:"max_input_chars"`
+	RequestTimeout string `toml:"request_timeout"`
 }
 
 type TokenResolution struct {
@@ -64,59 +98,72 @@ type TokenResolution struct {
 	Path   string
 }
 
-type OpenClawDiscord struct {
-	Token    string
-	GuildIDs []string
-	Path     string
-}
-
-type openClawConfig struct {
-	Channels struct {
-		Discord openClawDiscord `json:"discord"`
-	} `json:"channels"`
-}
-
-type openClawDiscord struct {
-	Token    string                         `json:"token"`
-	Accounts map[string]openClawDiscordAcct `json:"accounts"`
-	Guilds   map[string]json.RawMessage     `json:"guilds"`
-}
-
-type openClawDiscordAcct struct {
-	Token  string                     `json:"token"`
-	Guilds map[string]json.RawMessage `json:"guilds"`
+var appConfig = crawlconfig.App{
+	Name:          "discrawl",
+	ConfigEnv:     DefaultConfigEnv,
+	LegacyBaseDir: "~/.discrawl",
+	PlatformDirs:  true,
 }
 
 func Default() Config {
 	home, _ := os.UserHomeDir()
-	base := filepath.Join(home, ".discrawl")
+	paths, err := appConfig.DefaultPaths()
+	if err != nil {
+		base := filepath.Join(home, ".discrawl")
+		paths = crawlconfig.Paths{
+			DBPath:   filepath.Join(base, "discrawl.db"),
+			CacheDir: filepath.Join(base, "cache"),
+			LogDir:   filepath.Join(base, "logs"),
+			ShareDir: filepath.Join(base, "share"),
+		}
+	}
 	return Config{
 		Version:        1,
-		DBPath:         filepath.Join(base, "discrawl.db"),
-		CacheDir:       filepath.Join(base, "cache"),
-		LogDir:         filepath.Join(base, "logs"),
+		DBPath:         paths.DBPath,
+		CacheDir:       paths.CacheDir,
+		LogDir:         paths.LogDir,
 		DefaultGuildID: "",
 		Discord: DiscordConfig{
-			TokenSource:    "openclaw",
-			OpenClawConfig: filepath.Join(home, ".openclaw", "openclaw.json"),
-			Account:        "default",
-			TokenEnv:       DefaultTokenEnv,
+			TokenSource:         "env",
+			TokenEnv:            DefaultTokenEnv,
+			TokenKeyringService: DefaultTokenKeyringService,
+			TokenKeyringAccount: DefaultTokenKeyringAccount,
+		},
+		Desktop: DesktopConfig{
+			Path:         defaultDiscordDesktopPath(home),
+			MaxFileBytes: 64 << 20,
 		},
 		Sync: SyncConfig{
-			Concurrency:    defaultSyncConcurrency(),
-			RepairEvery:    "6h",
-			FullHistory:    true,
-			AttachmentText: boolPtr(true),
+			Source:             "both",
+			Concurrency:        defaultSyncConcurrency(),
+			RepairEvery:        "6h",
+			FullHistory:        true,
+			AttachmentText:     new(true),
+			AttachmentMedia:    new(false),
+			MaxAttachmentBytes: 100 << 20,
 		},
 		Search: SearchConfig{
 			DefaultMode: "fts",
 			Embeddings: EmbeddingsConfig{
-				Enabled:   false,
-				Provider:  "openai",
-				Model:     "text-embedding-3-small",
-				APIKeyEnv: "OPENAI_API_KEY",
-				BatchSize: 64,
+				Enabled:        false,
+				Provider:       "openai",
+				Model:          "text-embedding-3-small",
+				APIKeyEnv:      "OPENAI_API_KEY",
+				BatchSize:      64,
+				MaxInputChars:  12000,
+				RequestTimeout: "2m",
 			},
+		},
+		Share: ShareConfig{
+			RepoPath:   paths.ShareDir,
+			Branch:     "main",
+			AutoUpdate: true,
+			StaleAfter: "15m",
+			Media:      new(true),
+		},
+		Remote: crawlremote.Config{
+			Mode:     crawlremote.ModeLocal,
+			TokenEnv: DefaultRemoteTokenEnv,
 		},
 	}
 }
@@ -134,14 +181,12 @@ func defaultSyncConcurrency() int {
 }
 
 func ResolvePath(flagPath string) string {
-	if strings.TrimSpace(flagPath) != "" {
-		return flagPath
+	path, err := appConfig.ResolveConfigPath(flagPath)
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, ".discrawl", "config.toml")
 	}
-	if envPath := strings.TrimSpace(os.Getenv(DefaultConfigEnv)); envPath != "" {
-		return envPath
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".discrawl", "config.toml")
+	return path
 }
 
 func Load(path string) (Config, error) {
@@ -150,12 +195,8 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	data, err := os.ReadFile(expanded)
-	if err != nil {
+	if err := crawlconfig.LoadTOML(expanded, &cfg); err != nil {
 		return Config{}, err
-	}
-	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	if err := cfg.Normalize(); err != nil {
 		return Config{}, err
@@ -171,14 +212,7 @@ func Write(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(expanded), 0o755); err != nil {
-		return fmt.Errorf("mkdir config dir: %w", err)
-	}
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	return os.WriteFile(expanded, data, 0o600)
+	return crawlconfig.WriteTOML(expanded, cfg, 0o600)
 }
 
 func (c *Config) Normalize() error {
@@ -200,44 +234,128 @@ func (c *Config) Normalize() error {
 			c.LogDir = def.LogDir
 		}
 	}
+	c.Discord.TokenSource = strings.ToLower(strings.TrimSpace(c.Discord.TokenSource))
+	c.Discord.TokenEnv = strings.TrimSpace(c.Discord.TokenEnv)
+	c.Discord.TokenKeyringService = strings.TrimSpace(c.Discord.TokenKeyringService)
+	c.Discord.TokenKeyringAccount = strings.TrimSpace(c.Discord.TokenKeyringAccount)
 	if c.Discord.TokenSource == "" {
-		c.Discord.TokenSource = "openclaw"
-	}
-	if c.Discord.OpenClawConfig == "" {
-		c.Discord.OpenClawConfig = Default().Discord.OpenClawConfig
-	}
-	if c.Discord.Account == "" {
-		c.Discord.Account = "default"
+		c.Discord.TokenSource = "env"
 	}
 	if c.Discord.TokenEnv == "" {
 		c.Discord.TokenEnv = DefaultTokenEnv
 	}
+	if c.Discord.TokenKeyringService == "" {
+		c.Discord.TokenKeyringService = DefaultTokenKeyringService
+	}
+	if c.Discord.TokenKeyringAccount == "" {
+		c.Discord.TokenKeyringAccount = DefaultTokenKeyringAccount
+	}
+	if c.Desktop.Path == "" {
+		c.Desktop.Path = defaultDiscordDesktopPath(homeDir())
+	}
+	if c.Desktop.MaxFileBytes <= 0 {
+		c.Desktop.MaxFileBytes = 64 << 20
+	}
 	if c.Sync.Concurrency <= 0 {
 		c.Sync.Concurrency = defaultSyncConcurrency()
+	}
+	c.Sync.Source = strings.ToLower(strings.TrimSpace(c.Sync.Source))
+	if c.Sync.Source == "" {
+		c.Sync.Source = "both"
 	}
 	if c.Sync.RepairEvery == "" {
 		c.Sync.RepairEvery = "6h"
 	}
 	if c.Sync.AttachmentText == nil {
-		c.Sync.AttachmentText = boolPtr(true)
+		c.Sync.AttachmentText = new(true)
+	}
+	if c.Sync.AttachmentMedia == nil {
+		c.Sync.AttachmentMedia = new(false)
+	}
+	if c.Sync.MaxAttachmentBytes <= 0 {
+		c.Sync.MaxAttachmentBytes = 100 << 20
 	}
 	if c.Search.DefaultMode == "" {
 		c.Search.DefaultMode = "fts"
 	}
+	c.Search.Embeddings.Provider = strings.ToLower(strings.TrimSpace(c.Search.Embeddings.Provider))
+	c.Search.Embeddings.Model = strings.TrimSpace(c.Search.Embeddings.Model)
+	c.Search.Embeddings.BaseURL = strings.TrimRight(strings.TrimSpace(c.Search.Embeddings.BaseURL), "/")
+	c.Search.Embeddings.APIKeyEnv = strings.TrimSpace(c.Search.Embeddings.APIKeyEnv)
+	c.Search.Embeddings.RequestTimeout = strings.TrimSpace(c.Search.Embeddings.RequestTimeout)
 	if c.Search.Embeddings.Provider == "" {
 		c.Search.Embeddings.Provider = "openai"
 	}
 	if c.Search.Embeddings.Model == "" {
-		c.Search.Embeddings.Model = "text-embedding-3-small"
+		switch strings.ToLower(strings.TrimSpace(c.Search.Embeddings.Provider)) {
+		case "ollama", "llamacpp":
+			c.Search.Embeddings.Model = "nomic-embed-text"
+		default:
+			c.Search.Embeddings.Model = "text-embedding-3-small"
+		}
 	}
-	if c.Search.Embeddings.APIKeyEnv == "" {
+	if c.Search.Embeddings.APIKeyEnv == "" && c.Search.Embeddings.Provider == "openai" {
 		c.Search.Embeddings.APIKeyEnv = "OPENAI_API_KEY"
+	}
+	if (c.Search.Embeddings.Provider == "ollama" || c.Search.Embeddings.Provider == "llamacpp") && c.Search.Embeddings.APIKeyEnv == "OPENAI_API_KEY" {
+		c.Search.Embeddings.APIKeyEnv = ""
 	}
 	if c.Search.Embeddings.BatchSize <= 0 {
 		c.Search.Embeddings.BatchSize = 64
 	}
+	if c.Share.RepoPath == "" {
+		c.Share.RepoPath = Default().Share.RepoPath
+	}
+	if c.Share.Branch == "" {
+		c.Share.Branch = "main"
+	}
+	if c.Share.StaleAfter == "" {
+		c.Share.StaleAfter = "15m"
+	}
+	if c.Share.Media == nil {
+		c.Share.Media = new(true)
+	}
+	c.Share.Filter.IncludeChannelIDs = uniqueStrings(c.Share.Filter.IncludeChannelIDs)
+	c.Share.Filter.ExcludeChannelIDs = uniqueStrings(c.Share.Filter.ExcludeChannelIDs)
+	if c.Remote.TokenEnv == "" {
+		c.Remote.TokenEnv = DefaultRemoteTokenEnv
+	}
+	c.Remote.Normalize()
+	if c.Search.Embeddings.MaxInputChars <= 0 {
+		c.Search.Embeddings.MaxInputChars = 12000
+	}
+	if c.Search.Embeddings.RequestTimeout == "" {
+		c.Search.Embeddings.RequestTimeout = "2m"
+	}
+	if timeout, err := time.ParseDuration(c.Search.Embeddings.RequestTimeout); err != nil {
+		return fmt.Errorf("parse search.embeddings.request_timeout: %w", err)
+	} else if timeout <= 0 {
+		return errors.New("search.embeddings.request_timeout must be positive")
+	}
 	c.GuildIDs = uniqueStrings(c.GuildIDs)
 	return nil
+}
+
+func defaultDiscordDesktopPath(home string) string {
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "discord")
+	case "windows":
+		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+			return filepath.Join(appData, "discord")
+		}
+		return filepath.Join(home, "AppData", "Roaming", "discord")
+	default:
+		if configHome := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); configHome != "" {
+			return filepath.Join(configHome, "discord")
+		}
+		return filepath.Join(home, ".config", "discord")
+	}
+}
+
+func homeDir() string {
+	home, _ := os.UserHomeDir()
+	return home
 }
 
 func (c Config) EffectiveDefaultGuildID() string {
@@ -258,147 +376,39 @@ func (c Config) AttachmentTextEnabled() bool {
 	return c.Sync.AttachmentText == nil || *c.Sync.AttachmentText
 }
 
+func (c Config) AttachmentMediaEnabled() bool {
+	return c.Sync.AttachmentMedia != nil && *c.Sync.AttachmentMedia
+}
+
+func (c Config) ShareMediaEnabled() bool {
+	return c.Share.Media == nil || *c.Share.Media
+}
+
+func (c Config) ShareEnabled() bool {
+	return strings.TrimSpace(c.Share.Remote) != ""
+}
+
+func (c Config) RemoteEnabled() bool {
+	return c.Remote.Enabled()
+}
+
+func (c Config) RemoteCloudReadOnly() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Remote.Mode), crawlremote.ModeCloud)
+}
+
 func EnsureRuntimeDirs(cfg Config) error {
-	paths := []string{cfg.CacheDir, cfg.LogDir, filepath.Dir(cfg.DBPath)}
-	for _, path := range paths {
-		expanded, err := ExpandPath(path)
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(expanded, 0o755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", expanded, err)
-		}
-	}
-	return nil
+	return crawlconfig.EnsureRuntimeDirs(crawlconfig.RuntimeConfig{
+		DBPath:   cfg.DBPath,
+		CacheDir: cfg.CacheDir,
+		LogDir:   cfg.LogDir,
+	})
 }
 
 func ExpandPath(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("empty path")
 	}
-	if strings.HasPrefix(path, "~/") || path == "~" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("home dir: %w", err)
-		}
-		if path == "~" {
-			path = home
-		} else {
-			path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
-		}
-	}
-	return filepath.Clean(os.ExpandEnv(path)), nil
-}
-
-func ResolveDiscordToken(cfg Config) (TokenResolution, error) {
-	if err := cfg.Normalize(); err != nil {
-		return TokenResolution{}, err
-	}
-	if cfg.Discord.TokenSource != "env" {
-		openClaw, err := LoadOpenClawDiscord(cfg.Discord.OpenClawConfig, cfg.Discord.Account)
-		if err == nil && openClaw.Token != "" {
-			return TokenResolution{Token: openClaw.Token, Source: "openclaw", Path: openClaw.Path}, nil
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return TokenResolution{}, err
-		}
-	}
-	if envToken := NormalizeBotToken(os.Getenv(cfg.Discord.TokenEnv)); envToken != "" {
-		return TokenResolution{Token: envToken, Source: "env", Path: cfg.Discord.TokenEnv}, nil
-	}
-	return TokenResolution{}, errors.New("discord token not found in env or openclaw config")
-}
-
-func LoadOpenClawDiscord(path, account string) (OpenClawDiscord, error) {
-	paths, err := openClawCandidates(path)
-	if err != nil {
-		return OpenClawDiscord{}, err
-	}
-	for _, candidate := range paths {
-		info, err := loadOpenClawDiscordFile(candidate, account)
-		if err == nil && info.Token != "" {
-			return info, nil
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return OpenClawDiscord{}, err
-		}
-	}
-	return OpenClawDiscord{}, os.ErrNotExist
-}
-
-func loadOpenClawDiscordFile(path, account string) (OpenClawDiscord, error) {
-	expanded, err := ExpandPath(path)
-	if err != nil {
-		return OpenClawDiscord{}, err
-	}
-	data, err := os.ReadFile(expanded)
-	if err != nil {
-		return OpenClawDiscord{}, err
-	}
-	var payload openClawConfig
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return OpenClawDiscord{}, fmt.Errorf("parse openclaw config: %w", err)
-	}
-	discord := payload.Channels.Discord
-	token := NormalizeBotToken(discord.Token)
-	guildIDs := mapKeys(discord.Guilds)
-	if token == "" {
-		acct := discord.Accounts[normalizeAccount(account)]
-		if acct.Token == "" && account != normalizeAccount(account) {
-			acct = discord.Accounts[account]
-		}
-		token = NormalizeBotToken(acct.Token)
-		if len(guildIDs) == 0 {
-			guildIDs = mapKeys(acct.Guilds)
-		}
-	}
-	return OpenClawDiscord{
-		Token:    token,
-		GuildIDs: guildIDs,
-		Path:     expanded,
-	}, nil
-}
-
-func openClawCandidates(path string) ([]string, error) {
-	expanded, err := ExpandPath(path)
-	if err != nil {
-		return nil, err
-	}
-	candidates := []string{expanded}
-	matches, err := filepath.Glob(expanded + ".bak*")
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(matches)
-	candidates = append(candidates, matches...)
-	return uniqueStrings(candidates), nil
-}
-
-func NormalizeBotToken(raw string) string {
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "Bot ")
-	return strings.TrimSpace(raw)
-}
-
-func normalizeAccount(account string) string {
-	account = strings.TrimSpace(strings.ToLower(account))
-	if account == "" {
-		return "default"
-	}
-	return account
-}
-
-func boolPtr(value bool) *bool {
-	return &value
-}
-
-func mapKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return filepath.Clean(os.ExpandEnv(crawlconfig.ExpandHome(path))), nil
 }
 
 func uniqueStrings(in []string) []string {

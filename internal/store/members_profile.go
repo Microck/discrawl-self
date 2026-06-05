@@ -7,14 +7,16 @@ import (
 	"hash/fnv"
 	"strings"
 	"time"
+
+	"github.com/openclaw/discrawl/internal/store/storedb"
 )
 
 type MemberProfile struct {
 	Member         MemberRow    `json:"member"`
 	RawJSON        string       `json:"raw_json,omitempty"`
 	MessageCount   int          `json:"message_count"`
-	FirstMessageAt time.Time    `json:"first_message_at,omitempty"`
-	LastMessageAt  time.Time    `json:"last_message_at,omitempty"`
+	FirstMessageAt time.Time    `json:"first_message_at,omitzero"`
+	LastMessageAt  time.Time    `json:"last_message_at,omitzero"`
 	RecentMessages []MessageRow `json:"recent_messages,omitempty"`
 }
 
@@ -56,6 +58,7 @@ func (s *Store) rebuildMemberFTS(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `drop table if exists member_fts`); err != nil {
 		return fmt.Errorf("drop member_fts: %w", err)
 	}
+	// Uses SQLite FTS5's default unicode61 tokenizer; normalizeFTSQuery quotes user terms before MATCH.
 	if _, err := tx.ExecContext(ctx, `
 		create virtual table member_fts using fts5(
 			member_key unindexed,
@@ -67,6 +70,9 @@ func (s *Store) rebuildMemberFTS(ctx context.Context) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("create member_fts: %w", err)
+	}
+	if err := configureFTSBulkLoad(ctx, tx, "member_fts"); err != nil {
+		return err
 	}
 	rows, err := tx.QueryContext(ctx, `
 		select
@@ -94,6 +100,9 @@ func (s *Store) rebuildMemberFTS(ctx context.Context) error {
 	defer func() { _ = stmt.Close() }()
 
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var guildID string
 		var userID string
 		var username string
@@ -118,6 +127,9 @@ func (s *Store) rebuildMemberFTS(ctx context.Context) error {
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate member fts rebuild rows: %w", err)
+	}
+	if err := optimizeFTS(ctx, tx, "member_fts"); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -224,81 +236,39 @@ func (s *Store) MemberProfile(ctx context.Context, guildID, userID string, recen
 		Member:  *member,
 		RawJSON: member.RawJSON,
 	}
-	var first string
-	var last string
-	if err := s.db.QueryRowContext(ctx, `
-		select count(*), coalesce(min(created_at), ''), coalesce(max(created_at), '')
-		from messages
-		where guild_id = ? and author_id = ?
-	`, member.GuildID, member.UserID).Scan(&profile.MessageCount, &first, &last); err != nil {
-		return MemberProfile{}, err
-	}
-	profile.FirstMessageAt = parseTime(first)
-	profile.LastMessageAt = parseTime(last)
-
-	recentRows, err := s.db.QueryContext(ctx, `
-		select
-			m.id,
-			m.guild_id,
-			m.channel_id,
-			coalesce(c.name, ''),
-			coalesce(m.author_id, ''),
-			coalesce(
-				nullif(mem.display_name, ''),
-				nullif(mem.nick, ''),
-				nullif(mem.global_name, ''),
-				nullif(mem.username, ''),
-				nullif(json_extract(m.raw_json, '$.author.global_name'), ''),
-				nullif(json_extract(m.raw_json, '$.author.username'), ''),
-				''
-			),
-			case
-				when trim(coalesce(m.content, '')) <> '' then m.content
-				else m.normalized_content
-			end,
-			m.created_at,
-			coalesce(m.reply_to_message_id, ''),
-			m.has_attachments,
-			m.pinned
-		from messages m
-		left join channels c on c.id = m.channel_id
-		left join members mem on mem.guild_id = m.guild_id and mem.user_id = m.author_id
-		where m.guild_id = ? and m.author_id = ?
-		order by m.created_at desc, m.id desc
-		limit ?
-	`, member.GuildID, member.UserID, recentLimit)
+	stats, err := s.q.MemberMessageStats(ctx, storedb.MemberMessageStatsParams{
+		GuildID:  member.GuildID,
+		AuthorID: nullString(member.UserID),
+	})
 	if err != nil {
 		return MemberProfile{}, err
 	}
-	defer func() { _ = recentRows.Close() }()
+	profile.MessageCount = int(stats.MessageCount)
+	profile.FirstMessageAt = parseTime(stats.FirstMessageAt)
+	profile.LastMessageAt = parseTime(stats.LastMessageAt)
 
-	for recentRows.Next() {
-		var row MessageRow
-		var created string
-		var hasAttachments int
-		var pinned int
-		if err := recentRows.Scan(
-			&row.MessageID,
-			&row.GuildID,
-			&row.ChannelID,
-			&row.ChannelName,
-			&row.AuthorID,
-			&row.AuthorName,
-			&row.Content,
-			&created,
-			&row.ReplyToMessage,
-			&hasAttachments,
-			&pinned,
-		); err != nil {
-			return MemberProfile{}, err
-		}
-		row.CreatedAt = parseTime(created)
-		row.HasAttachments = hasAttachments == 1
-		row.Pinned = pinned == 1
-		profile.RecentMessages = append(profile.RecentMessages, row)
-	}
-	if err := recentRows.Err(); err != nil {
+	recentRows, err := s.q.ListRecentMemberMessages(ctx, storedb.ListRecentMemberMessagesParams{
+		GuildID:  member.GuildID,
+		AuthorID: nullString(member.UserID),
+		Limit:    int64(recentLimit),
+	})
+	if err != nil {
 		return MemberProfile{}, err
+	}
+	for _, recent := range recentRows {
+		profile.RecentMessages = append(profile.RecentMessages, MessageRow{
+			MessageID:      recent.MessageID,
+			GuildID:        recent.GuildID,
+			ChannelID:      recent.ChannelID,
+			ChannelName:    recent.ChannelName,
+			AuthorID:       recent.AuthorID,
+			AuthorName:     recent.AuthorName,
+			Content:        recent.Content,
+			CreatedAt:      parseTime(recent.CreatedAt),
+			ReplyToMessage: recent.ReplyToMessage,
+			HasAttachments: recent.HasAttachments == 1,
+			Pinned:         recent.Pinned == 1,
+		})
 	}
 	return profile, nil
 }

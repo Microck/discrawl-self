@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"errors"
+	"flag"
 	"strings"
 	"time"
+
+	"github.com/openclaw/discrawl/internal/store"
 )
 
 func (r *runtime) resolveSyncGuilds(guild, guilds string) []string {
@@ -17,9 +21,30 @@ func (r *runtime) resolveSyncGuilds(guild, guilds string) []string {
 	return nil
 }
 
+func (r *runtime) resolveSyncGuildsAll(guild, guilds string, all bool) ([]string, error) {
+	if !all {
+		return r.resolveSyncGuilds(guild, guilds), nil
+	}
+	if len(csvList(guilds)) > 0 || strings.TrimSpace(guild) != "" {
+		return nil, errors.New("use either --all or --guild/--guilds")
+	}
+	return nil, nil
+}
+
 func (r *runtime) resolveSearchGuilds(guild, guilds string) []string {
 	requested := append(csvList(guilds), strings.TrimSpace(guild))
 	return csvList(strings.Join(requested, ","))
+}
+
+func directMessageGuildScope(dm bool, guild, guilds string) ([]string, error) {
+	if !dm {
+		requested := append(csvList(guilds), strings.TrimSpace(guild))
+		return csvList(strings.Join(requested, ",")), nil
+	}
+	if len(csvList(guilds)) > 0 || strings.TrimSpace(guild) != "" {
+		return nil, errors.New("use either --dm or --guild/--guilds")
+	}
+	return []string{store.DirectMessageGuildID}, nil
 }
 
 func csvList(raw string) []string {
@@ -41,6 +66,16 @@ func csvList(raw string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+func flagPassed(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func mustDuration(raw string) time.Duration {

@@ -3,25 +3,28 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
 
-	_ "modernc.org/sqlite"
+	crawlstore "github.com/openclaw/crawlkit/store"
+	"github.com/openclaw/discrawl/internal/store/storedb"
 )
 
 const (
-	timeLayout        = time.RFC3339Nano
-	messageFTSVersion = "2"
-	memberFTSVersion  = "1"
+	timeLayout         = time.RFC3339Nano
+	messageFTSVersion  = "2"
+	memberFTSVersion   = "1"
+	storeSchemaVersion = 3
 )
+
+var ErrSchemaVersionMismatch = errors.New("database schema version mismatch")
 
 type Store struct {
 	db   *sql.DB
+	q    *storedb.Queries
 	path string
 }
 
@@ -33,8 +36,8 @@ type Status struct {
 	MessageCount       int       `json:"message_count"`
 	MemberCount        int       `json:"member_count"`
 	EmbeddingBacklog   int       `json:"embedding_backlog"`
-	LastSyncAt         time.Time `json:"last_sync_at,omitempty"`
-	LastTailEventAt    time.Time `json:"last_tail_event_at,omitempty"`
+	LastSyncAt         time.Time `json:"last_sync_at,omitzero"`
+	LastTailEventAt    time.Time `json:"last_tail_event_at,omitzero"`
 	DefaultGuildID     string    `json:"default_guild_id,omitempty"`
 	DefaultGuildName   string    `json:"default_guild_name,omitempty"`
 	AccessibleGuildIDs []string  `json:"accessible_guild_ids,omitempty"`
@@ -85,7 +88,7 @@ type MemberRow struct {
 	Avatar        string    `json:"avatar,omitempty"`
 	RoleIDsJSON   string    `json:"role_ids_json"`
 	Bot           bool      `json:"bot"`
-	JoinedAt      time.Time `json:"joined_at,omitempty"`
+	JoinedAt      time.Time `json:"joined_at,omitzero"`
 	Bio           string    `json:"bio,omitempty"`
 	Pronouns      string    `json:"pronouns,omitempty"`
 	Location      string    `json:"location,omitempty"`
@@ -109,70 +112,38 @@ type ChannelRow struct {
 	IsLocked         bool      `json:"is_locked"`
 	IsPrivateThread  bool      `json:"is_private_thread"`
 	ThreadParentID   string    `json:"thread_parent_id,omitempty"`
-	ArchiveTimestamp time.Time `json:"archive_timestamp,omitempty"`
+	ArchiveTimestamp time.Time `json:"archive_timestamp,omitzero"`
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir db dir: %w", err)
-	}
-	if err := ensureDBFile(path); err != nil {
-		return nil, err
-	}
-	dsn := fmt.Sprintf(
-		"file:%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)&_pragma=mmap_size(268435456)&_pragma=busy_timeout(5000)",
-		path,
-	)
-	db, err := sql.Open("sqlite", dsn)
+	base, err := crawlstore.Open(ctx, crawlstore.Options{Path: path})
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// SQLite is single-writer; keep one shared connection so concurrent callers queue
-	// instead of contending on separate writer connections.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping sqlite: %w", err)
-	}
-	if err := tightenDBFilePerms(path); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
-	store := &Store{db: db, path: path}
+	db := base.DB()
+	store := &Store{db: db, q: storedb.New(db), path: path}
 	if err := store.migrate(ctx); err != nil {
-		_ = db.Close()
+		_ = base.Close()
 		return nil, err
 	}
 	return store, nil
 }
 
-func ensureDBFile(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat db file: %w", err)
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	base, err := crawlstore.OpenReadOnly(ctx, path)
+	if err != nil {
+		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil && !os.IsExist(err) {
-		return fmt.Errorf("create db file: %w", err)
+	db := base.DB()
+	store := &Store{db: db, q: storedb.New(db), path: path}
+	if version, err := store.schemaVersion(ctx); err != nil {
+		_ = base.Close()
+		return nil, err
+	} else if version != storeSchemaVersion {
+		_ = base.Close()
+		return nil, fmt.Errorf("%w: got %d want %d", ErrSchemaVersionMismatch, version, storeSchemaVersion)
 	}
-	if file != nil {
-		if closeErr := file.Close(); closeErr != nil {
-			return fmt.Errorf("close db file: %w", closeErr)
-		}
-	}
-	return nil
-}
-
-func tightenDBFilePerms(path string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("chmod db file: %w", err)
-	}
-	return nil
+	return store, nil
 }
 
 func (s *Store) Close() error {
@@ -187,6 +158,144 @@ func (s *Store) DB() *sql.DB {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
+	currentVersion, err := s.schemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if currentVersion > storeSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", currentVersion, storeSchemaVersion)
+	}
+	if currentVersion < 1 {
+		if err := s.applyBaselineSchema(ctx); err != nil {
+			return err
+		}
+		if err := s.setSchemaVersion(ctx, 1); err != nil {
+			return err
+		}
+		currentVersion = 1
+	}
+	if currentVersion < 2 {
+		if err := s.applyQueryIndexMigration(ctx); err != nil {
+			return err
+		}
+		if err := s.setSchemaVersion(ctx, 2); err != nil {
+			return err
+		}
+		currentVersion = 2
+	}
+	if currentVersion < 3 {
+		if err := s.applyAttachmentMediaMigration(ctx); err != nil {
+			return err
+		}
+		if err := s.setSchemaVersion(ctx, 3); err != nil {
+			return err
+		}
+	}
+	if version, err := s.schemaVersion(ctx); err != nil {
+		return err
+	} else if version != storeSchemaVersion {
+		return fmt.Errorf("%w: got %d want %d", ErrSchemaVersionMismatch, version, storeSchemaVersion)
+	}
+	if err := s.applyQueryIndexMigration(ctx); err != nil {
+		return err
+	}
+	if err := s.applyAttachmentMediaMigration(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureFTSRowIDs(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureMemberFTSRowIDs(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureEmbeddingSearchIndexes(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) RebuildSearchIndexes(ctx context.Context) error {
+	if err := s.rebuildFTS(ctx); err != nil {
+		return err
+	}
+	if err := s.rebuildMemberFTS(ctx); err != nil {
+		return err
+	}
+	return s.stampSearchIndexVersions(ctx, true, true)
+}
+
+func (s *Store) RebuildMessageSearchIndex(ctx context.Context) error {
+	if err := s.rebuildFTS(ctx); err != nil {
+		return err
+	}
+	return s.stampSearchIndexVersions(ctx, true, false)
+}
+
+func (s *Store) RebuildMemberSearchIndex(ctx context.Context) error {
+	if err := s.rebuildMemberFTS(ctx); err != nil {
+		return err
+	}
+	return s.stampSearchIndexVersions(ctx, false, true)
+}
+
+func (s *Store) stampSearchIndexVersions(ctx context.Context, message, member bool) error {
+	now := time.Now().UTC().Format(timeLayout)
+	switch {
+	case message && member:
+		if _, err := s.db.ExecContext(ctx, `
+		insert into sync_state(scope, cursor, updated_at)
+		values(?, ?, ?), (?, ?, ?)
+		on conflict(scope) do update set
+			cursor=excluded.cursor,
+			updated_at=excluded.updated_at
+	`, "schema:message_fts_rowid_version", messageFTSVersion, now, "schema:member_fts_rowid_version", memberFTSVersion, now); err != nil {
+			return fmt.Errorf("stamp search index versions: %w", err)
+		}
+	case message:
+		if _, err := s.db.ExecContext(ctx, `
+		insert into sync_state(scope, cursor, updated_at)
+		values(?, ?, ?)
+		on conflict(scope) do update set
+			cursor=excluded.cursor,
+			updated_at=excluded.updated_at
+	`, "schema:message_fts_rowid_version", messageFTSVersion, now); err != nil {
+			return fmt.Errorf("stamp message search index version: %w", err)
+		}
+	case member:
+		if _, err := s.db.ExecContext(ctx, `
+		insert into sync_state(scope, cursor, updated_at)
+		values(?, ?, ?)
+		on conflict(scope) do update set
+			cursor=excluded.cursor,
+			updated_at=excluded.updated_at
+	`, "schema:member_fts_rowid_version", memberFTSVersion, now); err != nil {
+			return fmt.Errorf("stamp member search index version: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) schemaVersion(ctx context.Context) (int, error) {
+	var version int
+	if err := s.db.QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	return version, nil
+}
+
+func (s *Store) setSchemaVersion(ctx context.Context, version int) error {
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("pragma user_version = %d", version)); err != nil {
+		return fmt.Errorf("set schema version %d: %w", version, err)
+	}
+	return nil
+}
+
+func (s *Store) applyBaselineSchema(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
 	stmts := []string{
 		`create table if not exists guilds (
 			id text primary key,
@@ -266,6 +375,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			url text,
 			proxy_url text,
 			text_content text not null default '',
+			media_path text,
+			content_sha256 text,
+			content_size integer not null default 0,
+			fetched_at text,
+			fetch_status text not null default '',
+			fetch_error text not null default '',
 			updated_at text not null
 		);`,
 		`create table if not exists mention_events (
@@ -288,8 +403,24 @@ func (s *Store) migrate(ctx context.Context) error {
 			message_id text primary key,
 			state text not null,
 			attempts integer not null default 0,
+			provider text not null default '',
+			model text not null default '',
+			input_version text not null default '',
+			last_error text not null default '',
+			locked_at text,
 			updated_at text not null
 		);`,
+		`create table if not exists message_embeddings (
+			message_id text not null,
+			provider text not null,
+			model text not null,
+			input_version text not null,
+			dimensions integer not null,
+			embedding_blob blob not null,
+			embedded_at text not null,
+			primary key (message_id, provider, model, input_version)
+		);`,
+		// Uses SQLite FTS5's default unicode61 tokenizer; normalizeFTSQuery quotes user terms before MATCH.
 		`create virtual table if not exists message_fts using fts5(
 			message_id unindexed,
 			guild_id unindexed,
@@ -311,25 +442,160 @@ func (s *Store) migrate(ctx context.Context) error {
 		`create index if not exists idx_members_guild_id on members(guild_id);`,
 		`create index if not exists idx_messages_channel_id on messages(channel_id);`,
 		`create index if not exists idx_messages_guild_id on messages(guild_id);`,
+		`create index if not exists idx_messages_created_id on messages(created_at, id);`,
+		`create index if not exists idx_messages_guild_created_id on messages(guild_id, created_at, id);`,
+		`create index if not exists idx_messages_channel_created_id on messages(channel_id, created_at, id);`,
+		`create index if not exists idx_messages_author_created_id on messages(author_id, created_at, id);`,
 		`create index if not exists idx_events_message_id on message_events(message_id);`,
 		`create index if not exists idx_attachments_message_id on message_attachments(message_id);`,
 		`create index if not exists idx_attachments_channel_id on message_attachments(channel_id);`,
 		`create index if not exists idx_mentions_message_id on mention_events(message_id);`,
+		`create index if not exists idx_mentions_guild_event on mention_events(guild_id, event_at, event_id);`,
+		`create index if not exists idx_mentions_channel_event on mention_events(channel_id, event_at, event_id);`,
 		`create index if not exists idx_mentions_target on mention_events(target_type, target_id, event_at);`,
 		`create index if not exists idx_mentions_author on mention_events(author_id, event_at);`,
+		`create index if not exists idx_embedding_jobs_state_updated on embedding_jobs(state, updated_at);`,
+		`create index if not exists idx_message_embeddings_identity on message_embeddings(provider, model, input_version, dimensions);`,
 	}
 	for _, stmt := range stmts {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migrate: %w", err)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate baseline schema: %w", err)
 		}
 	}
-	if err := s.ensureFTSRowIDs(ctx); err != nil {
+	return tx.Commit()
+}
+
+func (s *Store) applyAttachmentMediaMigration(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	if err := s.ensureMemberFTSRowIDs(ctx); err != nil {
+	defer rollback(tx)
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"media_path", `alter table message_attachments add column media_path text`},
+		{"content_sha256", `alter table message_attachments add column content_sha256 text`},
+		{"content_size", `alter table message_attachments add column content_size integer not null default 0`},
+		{"fetched_at", `alter table message_attachments add column fetched_at text`},
+		{"fetch_status", `alter table message_attachments add column fetch_status text not null default ''`},
+		{"fetch_error", `alter table message_attachments add column fetch_error text not null default ''`},
+	} {
+		ok, err := columnExists(ctx, tx, "message_attachments", column.name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err := tx.ExecContext(ctx, column.sql); err != nil {
+				return fmt.Errorf("add message_attachments.%s: %w", column.name, err)
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `create index if not exists idx_attachments_sha256 on message_attachments(content_sha256)`); err != nil {
+		return fmt.Errorf("ensure attachment media index: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) applyQueryIndexMigration(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
+	}
+	defer rollback(tx)
+	if _, err := tx.ExecContext(ctx, `create table if not exists embedding_jobs (
+		message_id text primary key,
+		state text not null,
+		attempts integer not null default 0,
+		provider text not null default '',
+		model text not null default '',
+		input_version text not null default '',
+		last_error text not null default '',
+		locked_at text,
+		updated_at text not null
+	);`); err != nil {
+		return fmt.Errorf("ensure embedding_jobs: %w", err)
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{"provider", `alter table embedding_jobs add column provider text not null default ''`},
+		{"model", `alter table embedding_jobs add column model text not null default ''`},
+		{"input_version", `alter table embedding_jobs add column input_version text not null default ''`},
+		{"last_error", `alter table embedding_jobs add column last_error text not null default ''`},
+		{"locked_at", `alter table embedding_jobs add column locked_at text`},
+	} {
+		ok, err := columnExists(ctx, tx, "embedding_jobs", column.name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err := tx.ExecContext(ctx, column.sql); err != nil {
+				return fmt.Errorf("add embedding_jobs.%s: %w", column.name, err)
+			}
+		}
+	}
+	stmts := []string{
+		`create table if not exists message_embeddings (
+			message_id text not null,
+			provider text not null,
+			model text not null,
+			input_version text not null,
+			dimensions integer not null,
+			embedding_blob blob not null,
+			embedded_at text not null,
+			primary key (message_id, provider, model, input_version)
+		);`,
+		`create index if not exists idx_messages_guild_created_id on messages(guild_id, created_at, id);`,
+		`create index if not exists idx_messages_channel_created_id on messages(channel_id, created_at, id);`,
+		`create index if not exists idx_messages_author_created_id on messages(author_id, created_at, id);`,
+		`create index if not exists idx_messages_created_id on messages(created_at, id);`,
+		`create index if not exists idx_mentions_guild_event on mention_events(guild_id, event_at, event_id);`,
+		`create index if not exists idx_mentions_channel_event on mention_events(channel_id, event_at, event_id);`,
+		`create index if not exists idx_embedding_jobs_state_updated on embedding_jobs(state, updated_at);`,
+		`create index if not exists idx_message_embeddings_identity on message_embeddings(provider, model, input_version, dimensions);`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate query indexes: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ensureEmbeddingSearchIndexes(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+		create index if not exists idx_message_embeddings_identity
+		on message_embeddings(provider, model, input_version, dimensions)
+	`)
+	if err != nil {
+		return fmt.Errorf("ensure embedding search indexes: %w", err)
 	}
 	return nil
+}
+
+func columnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `pragma table_info(`+table+`)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) ensureFTSRowIDs(ctx context.Context) error {
@@ -370,6 +636,7 @@ func (s *Store) rebuildFTS(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `drop table if exists message_fts`); err != nil {
 		return fmt.Errorf("drop message_fts: %w", err)
 	}
+	// Uses SQLite FTS5's default unicode61 tokenizer; normalizeFTSQuery quotes user terms before MATCH.
 	if _, err := tx.ExecContext(ctx, `
 		create virtual table message_fts using fts5(
 			message_id unindexed,
@@ -382,6 +649,9 @@ func (s *Store) rebuildFTS(ctx context.Context) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("create message_fts: %w", err)
+	}
+	if err := configureFTSBulkLoad(ctx, tx, "message_fts"); err != nil {
+		return err
 	}
 	rows, err := tx.QueryContext(ctx, `
 		select
@@ -417,6 +687,9 @@ func (s *Store) rebuildFTS(ctx context.Context) error {
 	defer func() { _ = stmt.Close() }()
 
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var (
 			messageID   string
 			guildID     string
@@ -440,7 +713,37 @@ func (s *Store) rebuildFTS(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate fts rebuild rows: %w", err)
 	}
+	if err := optimizeFTS(ctx, tx, "message_fts"); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func configureFTSBulkLoad(ctx context.Context, tx *sql.Tx, table string) error {
+	if table != "message_fts" && table != "member_fts" {
+		return fmt.Errorf("unsupported fts table %q", table)
+	}
+	stmts := []string{
+		fmt.Sprintf("insert into %s(%s, rank) values('pgsz', 32768)", table, table),
+		fmt.Sprintf("insert into %s(%s, rank) values('automerge', 0)", table, table),
+		fmt.Sprintf("insert into %s(%s, rank) values('crisismerge', 64)", table, table),
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("configure %s bulk load: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func optimizeFTS(ctx context.Context, tx *sql.Tx, table string) error {
+	if table != "message_fts" && table != "member_fts" {
+		return fmt.Errorf("unsupported fts table %q", table)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("insert into %s(%s) values('optimize')", table, table)); err != nil {
+		return fmt.Errorf("optimize %s: %w", table, err)
+	}
+	return nil
 }
 
 func messageFTSRowID(messageID string) (int64, bool) {

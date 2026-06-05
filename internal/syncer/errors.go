@@ -21,13 +21,33 @@ func (s *Syncer) skipSyncError(ctx context.Context, channel *discordgo.Channel, 
 }
 
 func (s *Syncer) skipUnavailableChannel(ctx context.Context, channel *discordgo.Channel, err error) bool {
+	if channel == nil {
+		return false
+	}
+	return s.skipUnavailableChannelByID(ctx, channel.ID, err, "channel message crawl skipped", channelMessageUnavailableScope)
+}
+
+func (s *Syncer) skipThreadCatalogUnavailableChannelByID(ctx context.Context, channelID string, err error, logMsg string) bool {
+	return s.skipUnavailableChannelByID(ctx, channelID, err, logMsg, channelThreadCatalogUnavailableScope)
+}
+
+func (s *Syncer) skipUnavailableChannelByID(ctx context.Context, channelID string, err error, logMsg string, scopeForChannel func(string) string) bool {
 	reason := unavailableReason(err)
 	if reason == "" {
 		return false
 	}
-	s.logger.Warn("channel message crawl skipped", "channel_id", channel.ID, "err", err)
-	if s.store != nil {
-		_ = s.store.SetSyncState(ctx, "channel:"+channel.ID+":unavailable", reason)
+	alreadyKnown := false
+	if s.store != nil && channelID != "" && scopeForChannel != nil {
+		scope := scopeForChannel(channelID)
+		if previous, stateErr := s.store.GetSyncState(ctx, scope); stateErr == nil && previous == reason {
+			alreadyKnown = true
+		}
+		_ = s.store.SetSyncState(ctx, scope, reason)
+	}
+	if alreadyKnown {
+		s.logger.Debug(logMsg, "channel_id", channelID, "reason", reason)
+	} else {
+		s.logger.Warn(logMsg, "channel_id", channelID, "err", err)
 	}
 	return true
 }

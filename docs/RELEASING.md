@@ -7,7 +7,7 @@ summary: "Release checklist for discrawl (GitHub release binaries via GoReleaser
 Always do all steps below. No partial releases.
 
 Assumptions:
-- Repo: `steipete/discrawl`
+- Repo: `openclaw/discrawl`
 - Binary: `discrawl`
 - GoReleaser config: `.goreleaser.yaml`
 - Homebrew tap repo: `~/Projects/homebrew-tap`
@@ -22,14 +22,15 @@ Assumptions:
 ## 1) Verify build + tests
 
 ```sh
-go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0 run
-go test ./... -coverprofile=coverage.out
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.1 run
+go test -count=1 ./... -coverprofile=coverage.out
 go tool cover -func=coverage.out | tail -n 1
+go test -count=1 -race ./...
 go build -o /tmp/discrawl ./cmd/discrawl
 gh run list -L 5 --branch main
 ```
 
-Coverage floor: `80%+`
+Coverage floor: `85%+`
 
 ## 2) Update changelog
 
@@ -69,28 +70,29 @@ Confirm assets exist for:
 
 ## 5) Update Homebrew tap
 
-`discrawl` currently ships a source-build formula in `~/Projects/homebrew-tap/Formula/discrawl.rb`.
+`discrawl` ships a binary formula in `~/Projects/homebrew-tap/Formula/discrawl.rb` that points at the GitHub release archives.
 
 After tagging a real release:
 
-1. switch the formula URL from the pinned source-commit tarball to the release tag tarball or release binaries
-2. update `sha256`
-3. test locally
+1. update the formula `version`
+2. update the per-platform release archive `sha256` values
+3. test local install + version output
 4. commit + push `homebrew-tap`
 
 Useful commands:
 
 ```sh
-curl -L -o /tmp/discrawl.tgz https://github.com/steipete/discrawl/archive/refs/tags/vX.Y.Z.tar.gz
-shasum -a 256 /tmp/discrawl.tgz
+curl -L -o /tmp/discrawl-darwin-arm64.tgz https://github.com/openclaw/discrawl/releases/download/vX.Y.Z/discrawl_X.Y.Z_darwin_arm64.tar.gz
+shasum -a 256 /tmp/discrawl-darwin-arm64.tgz
 brew uninstall discrawl || true
-brew install --build-from-source ./Formula/discrawl.rb
-brew test discrawl
+brew install openclaw/tap/discrawl
+discrawl --version
+brew info openclaw/tap/discrawl
 ```
 
 ## Notes
 
-- Build-time version stamping comes from `-X github.com/steipete/discrawl/internal/cli.version={{ .Version }}`
+- Build-time version stamping comes from `-X github.com/openclaw/discrawl/internal/cli.version={{ .Version }}`
 - If release workflow needs a rerun:
 
 ```sh

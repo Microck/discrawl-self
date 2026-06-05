@@ -6,6 +6,7 @@ Goal:
 
 - build a local-first Discord guild crawler
 - mirror all guild data the configured bot can access
+- import classifiable Discord Desktop cache messages without user tokens, including DMs
 - store it in SQLite
 - support fast text search, semantic search, and raw SQL
 - support one-shot backfill and long-running live sync
@@ -26,6 +27,7 @@ V1 scope:
 - all accessible private threads
 - archived thread coverage
 - full message history
+- desktop-local import from cached Discord Desktop artifacts, with proven DMs stored under `@me`
 - current member snapshot
 - FTS5 search
 - optional OpenAI embeddings with local vector search
@@ -33,7 +35,8 @@ V1 scope:
 
 Out of scope for V1:
 
-- personal-account DMs
+- remote/API personal-account DM crawling
+- Discord user-token automation/selfbot flows
 - reactions as primary indexed entities
 - attachment blob downloads by default
 - cross-guild unified sync UX
@@ -44,11 +47,16 @@ Out of scope for V1:
 These are settled unless the user explicitly changes them:
 
 - config format: `TOML`
-- config location: `~/.discrawl/config.toml`
-- DB location: `~/.discrawl/discrawl.db`
-- cache dir: `~/.discrawl/cache/`
-- log dir: `~/.discrawl/logs/`
-- token source: reuse Molty / existing OpenClaw Discord bot config
+- config location: platform-native XDG config dir, e.g.
+  `${XDG_CONFIG_HOME:-~/.config}/discrawl/config.toml` on Linux
+- DB location: platform-native XDG data dir, e.g.
+  `${XDG_DATA_HOME:-~/.local/share}/discrawl/discrawl.db` on Linux
+- cache dir: platform-native XDG cache dir, e.g. `${XDG_CACHE_HOME:-~/.cache}/discrawl/`
+- log dir: platform-native XDG state dir, e.g.
+  `${XDG_STATE_HOME:-~/.local/state}/discrawl/logs/`
+- legacy installs with `~/.discrawl/config.toml` continue to load that config when the new default
+  config file does not exist, even if XDG env vars are present
+- token source: `DISCORD_BOT_TOKEN` or configured env var, then optional OS keyring fallback
 - guild model: one guild in CLI UX, multi-guild-ready schema
 - search: hybrid, with FTS first and embeddings optional
 - embedding provider: OpenAI
@@ -68,33 +76,12 @@ An agent should assume:
 - Go is installed and modern
 - user is Peter
 - user keeps many secrets in `~/.profile`
-- an existing OpenClaw install may already contain usable Discord bot config
 
 ### Key file paths
 
-- `~/.discrawl/config.toml`
-- `~/.discrawl/discrawl.db`
+- platform-native Discrawl config file
+- platform-native Discrawl SQLite database
 - `~/.profile`
-- `~/.openclaw/openclaw.json`
-- `~/.openclaw/openclaw.json.bak*`
-
-### Existing bot config
-
-The current bot token source is expected in:
-
-- `~/.openclaw/openclaw.json`
-
-Expected path inside JSON:
-
-- `channels.discord.token`
-
-Expected guild selection path:
-
-- `channels.discord.guilds`
-
-The current intended default mode is:
-
-- `discrawl init --from-openclaw ~/.openclaw/openclaw.json`
 
 ### OpenAI embeddings key
 
@@ -118,6 +105,8 @@ Important Discord facts that drive the schema:
 - forum posts are threads under a forum parent
 - message history is paginated and must be backfilled incrementally
 - live updates come from Gateway events, not from polling alone
+- personal DMs are only supported through desktop-local cache import
+- desktop cache messages without a provable channel/guild route are skipped rather than stored as unknown data
 - archived public and private threads must be enumerated explicitly
 - private archived thread access may require elevated bot perms like `Manage Threads`
 
@@ -410,6 +399,7 @@ discrawl [global flags] <command> [args]
 - `init`
 - `sync`
 - `tail`
+- `wiretap`
 - `search`
 - `sql`
 - `members`
@@ -421,13 +411,12 @@ discrawl [global flags] <command> [args]
 
 Purpose:
 
-- create `~/.discrawl/config.toml`
-- import defaults from OpenClaw
+- create the platform-native Discrawl config file
+- discover accessible Discord guilds
 - persist guild id and DB path
 
 Expected flags:
 
-- `--from-openclaw <path>`
 - `--guild <id>`
 - `--db <path>`
 - `--with-embeddings`
@@ -467,6 +456,29 @@ Requirements:
 - reconnect automatically
 - write checkpoints
 - periodic repair sync
+
+### `wiretap`
+
+Purpose:
+
+- import Discord Desktop cache artifacts into the local archive
+- make cached personal DMs searchable under synthetic guild id `@me`
+
+Expected flags:
+
+- `--path <dir>`
+- `--dry-run`
+- `--watch-every <duration>`
+- `--max-file-bytes <bytes>`
+- `--full-cache`
+
+Requirements:
+
+- never use Discord user tokens
+- never extract or persist auth tokens from desktop cache
+- scan bounded local files only
+- default to route-bearing HTTP cache entries; exhaustive Chromium cache scans require explicit full-cache mode
+- store sanitized raw metadata, not full arbitrary cache blobs
 
 ### `search`
 
@@ -529,7 +541,7 @@ Must show:
 Must check:
 
 - config file readable
-- OpenClaw token source readable
+- Discord token env var readable unless live access is disabled
 - Discord auth valid
 - guild reachable
 - DB openable
@@ -544,21 +556,22 @@ Format:
 
 Location:
 
-- `~/.discrawl/config.toml`
+- platform-native Discrawl config file
 
 Suggested shape:
 
 ```toml
 version = 1
 guild_id = "1456350064065904867"
-db_path = "~/.discrawl/discrawl.db"
-cache_dir = "~/.discrawl/cache"
-log_dir = "~/.discrawl/logs"
+db_path = "~/.local/share/discrawl/discrawl.db"
+cache_dir = "~/.cache/discrawl"
+log_dir = "~/.local/state/discrawl/logs"
 
 [discord]
-token_source = "openclaw"
-openclaw_config = "~/.openclaw/openclaw.json"
-channel_account = "discord"
+token_source = "env"
+token_env = "DISCORD_BOT_TOKEN"
+token_keyring_service = "discrawl"
+token_keyring_account = "discord_bot_token"
 
 [sync]
 concurrency = 4
@@ -585,6 +598,7 @@ Config precedence:
 Environment variables:
 
 - `DISCRAWL_CONFIG`
+- `DISCORD_BOT_TOKEN`
 - `OPENAI_API_KEY`
 
 ## Token Handling Rules
@@ -597,7 +611,8 @@ Do not:
 
 Do:
 
-- load bot token from OpenClaw config path
+- load bot token from env
+- fall back to the configured OS keyring item when env is empty
 - load OpenAI key from env
 - redact secrets in debug and doctor output
 
@@ -781,3 +796,54 @@ For an AI agent to finish the product without external memory, this repo should 
 - milestone order
 
 This file is the authoritative engineering spec for now.
+
+## Digest
+
+`discrawl digest` provides a per-channel activity summary over a lookback window.
+
+Example usage:
+
+```bash
+discrawl digest
+discrawl digest --since 7d
+discrawl digest --since 30d --guild 123456789012345678
+discrawl digest --channel general --top-n 5
+discrawl --json digest --since 72h
+```
+
+Behavior:
+
+- window defaults to `7d` when `--since` is omitted
+- `--since` accepts Go durations (`72h`, `30m`) and `Nd` shorthand (`7d`, `30d`)
+- `--guild` filters by `guild_id`; empty means no guild filter
+- `--channel` accepts channel id or exact channel name
+- per-channel metrics include `messages`, `replies`, and `active_authors`
+- top posters are ranked by message count using member display fallback order: `display_name -> nick -> global_name -> username -> author_id -> unknown`
+- top mentions are ranked from `mention_events` and include all target types (`user` and `role`)
+- channels are sorted by message count descending, then channel name ascending
+- JSON output returns a `Digest` object with channel rows and totals; plain output emits one tab-separated row per channel
+
+## Analytics
+
+`discrawl analytics` is a subcommand group for activity-style queries.
+
+Example usage:
+
+```bash
+discrawl analytics
+discrawl analytics quiet --since 30d
+discrawl analytics quiet --guild 123456789012345678
+discrawl analytics trends --weeks 8
+discrawl analytics trends --weeks 12 --channel general
+discrawl --json analytics quiet --since 60d
+discrawl --json analytics trends --weeks 4
+```
+
+Behavior:
+
+- `analytics quiet` defaults to `30d` lookback and supports `--guild`
+- `analytics quiet` includes top-level text/announcement channels with no messages at all
+- quiet rows are sorted with never-active channels first, then by longest silence
+- `analytics trends` defaults to `8` weeks and supports `--guild` plus `--channel` (id or exact name)
+- `analytics trends` buckets messages into Monday-start UTC weeks and zero-fills missing weeks for every returned message-capable channel
+- trends rows are sorted by total messages descending, then channel name ascending

@@ -3,7 +3,6 @@ package syncer
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,7 +10,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/stretchr/testify/require"
 
-	"github.com/steipete/discrawl/internal/store"
+	"github.com/openclaw/discrawl/internal/store"
 )
 
 func TestNormalizeMessageIncludesRichFields(t *testing.T) {
@@ -42,6 +41,26 @@ func TestNormalizeMessageIncludesRichFields(t *testing.T) {
 	require.Contains(t, content, "reply:prior")
 	require.Contains(t, content, "question")
 	require.Contains(t, content, "answer")
+}
+
+func TestNormalizeMessageSanitizesMalformedUnicodeAndWhitespace(t *testing.T) {
+	t.Parallel()
+
+	message := &discordgo.Message{
+		Content: string([]byte{'h', 'i', 0xff, ' ', 't', 'h', 'e', 'r', 'e'}) + "\u200b",
+		Attachments: []*discordgo.MessageAttachment{
+			{Filename: "Ｆｏｏ\u200d.txt"},
+		},
+		Embeds: []*discordgo.MessageEmbed{
+			{Title: " spaced\u00a0out ", Description: "line\u0000break"},
+		},
+		ReferencedMessage: &discordgo.Message{Content: "prior reply"},
+	}
+
+	content := normalizeMessage(message)
+	require.Equal(t, "hi there\nFoo.txt\nspaced out\nlinebreak\nreply:prior reply", content)
+	require.NotContains(t, content, "\u200b")
+	require.NotContains(t, content, "\u200d")
 }
 
 func TestTailHandlerWritesEvents(t *testing.T) {
@@ -166,16 +185,16 @@ func TestHelpers(t *testing.T) {
 	require.Equal(t, "Nick", displayName(&discordgo.Member{Nick: "Nick", User: &discordgo.User{Username: "user"}}))
 	require.Equal(t, "Global", displayName(&discordgo.Member{User: &discordgo.User{GlobalName: "Global", Username: "user"}}))
 	require.Equal(t, "user", displayName(&discordgo.Member{User: &discordgo.User{Username: "user"}}))
-	require.True(t, isMissingAccess(fmt.Errorf("HTTP 403 Forbidden")))
-	require.True(t, isMissingAccess(fmt.Errorf("Missing Access")))
-	require.False(t, isMissingAccess(fmt.Errorf("boom")))
-	require.Equal(t, "missing_access", unavailableReason(fmt.Errorf("HTTP 403 Forbidden")))
-	require.Equal(t, "unknown_channel", unavailableReason(fmt.Errorf("HTTP 404 Not Found, {\"message\": \"Unknown Channel\", \"code\": 10003}")))
-	require.True(t, isUnknownChannel(fmt.Errorf("Unknown Channel")))
-	require.False(t, isUnknownChannel(fmt.Errorf("boom")))
+	require.True(t, isMissingAccess(errors.New("HTTP 403 Forbidden")))
+	require.True(t, isMissingAccess(errors.New("Missing Access")))
+	require.False(t, isMissingAccess(errors.New("boom")))
+	require.Equal(t, "missing_access", unavailableReason(errors.New("HTTP 403 Forbidden")))
+	require.Equal(t, "unknown_channel", unavailableReason(errors.New("HTTP 404 Not Found, {\"message\": \"Unknown Channel\", \"code\": 10003}")))
+	require.True(t, isUnknownChannel(errors.New("Unknown Channel")))
+	require.False(t, isUnknownChannel(errors.New("boom")))
 	require.True(t, isRetryableSyncError(context.Background(), context.DeadlineExceeded))
-	require.True(t, isRetryableSyncError(context.Background(), fmt.Errorf("HTTP 503 Service Unavailable")))
-	require.True(t, isRetryableSyncError(context.Background(), fmt.Errorf("stream error: stream ID 1; INTERNAL_ERROR")))
+	require.True(t, isRetryableSyncError(context.Background(), errors.New("HTTP 503 Service Unavailable")))
+	require.True(t, isRetryableSyncError(context.Background(), errors.New("stream error: stream ID 1; INTERNAL_ERROR")))
 	require.False(t, isRetryableSyncError(context.Background(), context.Canceled))
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -192,10 +211,14 @@ func TestRunTail(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = s.Close() }()
 
-	client := &fakeClient{}
+	handled := make(chan struct{}, 1)
+	client := &fakeClient{tailHandled: handled}
 	svc := New(client, s, nil)
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-handled:
+		case <-time.After(time.Second):
+		}
 		cancel()
 	}()
 	err = svc.RunTail(ctx, nil, 0)
